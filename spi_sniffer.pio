@@ -1,0 +1,174 @@
+; =============================================================================
+; SPI Bus Sniffer PIO Assembly Script (spi_sniffer.pio)
+; Passive SPI Bus sniffer utilizing the RP2040/RP2350 PIO blocks.
+; =============================================================================
+
+.define PUBLIC IRQ_EVENT   7    ; Internal state machine synchronization interrupt
+
+.define PUBLIC EV_DATA     0x00 ; Signal state for valid data phase
+.define PUBLIC EV_START    0x01 ; Signal state for frame start sequence
+.define PUBLIC EV_STOP     0x03 ; Signal state for frame stop sequence
+
+; --- START DETECTOR STATE MACHINE (CS Edge Fall) ---
+.program spi_start
+.wrap_target
+wait_cs_low:
+    wait 0 pin 0            ; Block until Chip Select falls to low (Frame Start relative to IN base)
+    set pins EV_START       ; Signal EV0=1, EV1=0 on virtual event pins
+    irq wait IRQ_EVENT      ; Fire event interrupt to wake up spi_main
+    wait 1 pin 0            ; Lock execution until CS rises to prevent loop spamming
+.wrap
+
+; --- STOP DETECTOR STATE MACHINE (CS Edge Rise) ---
+.program spi_stop
+.wrap_target
+wait_cs_high:
+    wait 1 pin 0            ; Block until Chip Select rises to high (Frame Stop relative to IN base)
+    set pins EV_STOP        ; Signal EV0=1, EV1=1 on virtual event pins
+    irq wait IRQ_EVENT      ; Fire event interrupt to wake up spi_main
+    wait 0 pin 0            ; Lock execution until CS falls to prevent loop spamming
+.wrap
+
+; --- DATA SAMPLER STATE MACHINE (Hardware Gating via JMP PIN) ---
+.program spi_data
+.wrap_target
+    wait 1 pin 0            ; Block until Clock rises to high (Sampling Edge relative to IN base)
+    jmp pin wait_clk_fall   ; If CS JMP pin is HIGH (Inactive), skip data capture and IRQ
+    set pins EV_DATA        ; Signal EV0=0, EV1=0 (Data Phase)
+    irq wait IRQ_EVENT      ; Fire event interrupt to wake up spi_main
+wait_clk_fall:    
+    wait 0 pin 0            ; Block until Clock falls to low (relative to IN base)
+.wrap
+
+; --- MAIN UNIFIED RECEIVE STATE MACHINE ---
+.program spi_main
+.wrap_target
+
+wait_for_start:
+    wait 1 irq IRQ_EVENT    ; 1. Wait for the first event (Clock or CS change)
+    jmp pin handle_cs_idle  ; 2. If JMP pin (EV0) is '1', it's an idle CS transition (between bytes)
+                            ;    Go straight to clean dispatch, WITHOUT sending any error token!
+    
+    ; --- VALID BYTE START ---
+    set x, 6                ; Prepare X to count the remaining 7 clock cycles (6 down to 0)
+    in pins, 2              ; Capture the first 2 bits from the immediate 1st clock pulse
+
+read_loop:
+    wait 1 irq IRQ_EVENT    ; Wait for the next clock pulse event
+    jmp pin cs_interrupted  ; CONDITIONAL ALERT! If JMP pin (EV0) goes '1' mid-loop,
+                            ; it means CS aborted the byte. Jump immediately to error handling.
+    
+    in pins, 2              ; SPI clock is valid: shift in the next 2 bits (MOSI & MISO)
+    jmp x-- read_loop       ; Decrement software counter.
+                            ; On the 8th clock (X rolls over), the hardware 16-bit
+                            ; autopush triggers precisely and empties the ISR to the FIFO.
+    jmp wait_for_start      ; Byte completed perfectly. Loop back to wait for the next start.
+
+; =============================================================================
+; --- CONTROL & ERROR EVENT PROCESSING ---
+; =============================================================================
+
+cs_interrupted:
+    ; --- THIS BLOCK ONLY EXECUTES IF THE SPI BYTE WAS LEFT INCOMPLETE ---
+    mov isr, ! null         ; Overwrite the entire ISR with 0xFFFFFFFF (Error Token)
+    push noblock            ; Manually flush it to the RX FIFO and force hardware shift counter to 0
+
+handle_cs_idle:
+    ; --- THIS BLOCK EXECUTES FOR ALL VALID CS BOUNDARY TRANSITIONS ---
+    mov isr, pins           ; Take a clean snapshot of current pin states (IN pins mapping base)
+    in NULL, 16             ; Shift pin status 16 bits left to meet your high-word C format
+                            ; Upon reaching 16 bits, hardware autopush fires cleanly.
+.wrap
+
+% c-sdk {
+
+// Initializer helper for the SPI Start State Machine (SM)
+void spi_start_program_init(PIO pio, uint sm, uint offset, float div, uint cs_pin, uint ev0_pin) {
+    pio_sm_config c = spi_start_program_get_default_config(offset);
+    
+    pio_gpio_init(pio, ev0_pin);
+    pio_gpio_init(pio, ev0_pin + 1);
+    sm_config_set_set_pins(&c, ev0_pin, 2);
+    pio_sm_set_consecutive_pindirs(pio, sm, ev0_pin, 2, true);
+    
+    gpio_init(cs_pin);
+    gpio_set_dir(cs_pin, GPIO_IN);
+    gpio_disable_pulls(cs_pin);
+    sm_config_set_in_pins(&c, cs_pin); 
+    
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+// Initializer helper for the SPI Stop State Machine (SM)
+void spi_stop_program_init(PIO pio, uint sm, uint offset, float div, uint cs_pin, uint ev0_pin) {
+    pio_sm_config c = spi_stop_program_get_default_config(offset);
+    
+    pio_gpio_init(pio, ev0_pin);
+    pio_gpio_init(pio, ev0_pin + 1);
+    sm_config_set_set_pins(&c, ev0_pin, 2);
+    pio_sm_set_consecutive_pindirs(pio, sm, ev0_pin, 2, true);
+    
+    gpio_init(cs_pin);
+    gpio_set_dir(cs_pin, GPIO_IN);
+    gpio_disable_pulls(cs_pin);
+    sm_config_set_in_pins(&c, cs_pin); 
+    
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+// Initializer helper for the SPI Clock Sampler State Machine (SM)
+void spi_data_program_init(PIO pio, uint sm, uint offset, float div, uint clk_pin, uint cs_pin, uint ev0_pin) {
+    pio_sm_config c = spi_data_program_get_default_config(offset);
+    
+    // Configure virtual event pins as outputs driven by this state machine
+    pio_gpio_init(pio, ev0_pin);
+    pio_gpio_init(pio, ev0_pin + 1);
+    sm_config_set_set_pins(&c, ev0_pin, 2);
+    pio_sm_set_consecutive_pindirs(pio, sm, ev0_pin, 2, true);
+    
+    // Configure Clock Pin as Relative Input Base
+    gpio_init(clk_pin);
+    gpio_set_dir(clk_pin, GPIO_IN);
+    gpio_disable_pulls(clk_pin);
+    sm_config_set_in_pins(&c, clk_pin);
+    
+    // Route dynamic CS pin explicitly as the conditional JMP validation target
+    pio_gpio_init(pio, cs_pin);
+    gpio_init(cs_pin);
+    gpio_set_dir(cs_pin, GPIO_IN);
+    gpio_disable_pulls(cs_pin);
+    sm_config_set_jmp_pin(&c, cs_pin);
+    
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+// Initializer helper for the main Unified SPI Sniffer State Machine (SM)
+void spi_main_program_init(PIO pio, uint sm, uint offset, float div, uint mosi_pin, uint ev0_pin) {
+    pio_sm_config c = spi_main_program_get_default_config(offset);
+    
+    gpio_init(mosi_pin);
+    gpio_set_dir(mosi_pin, GPIO_IN);
+    gpio_disable_pulls(mosi_pin);
+    
+    gpio_init(mosi_pin + 1); 
+    gpio_set_dir(mosi_pin + 1, GPIO_IN);
+    gpio_disable_pulls(mosi_pin + 1);
+
+    // Map all 4 operational target channels consecutively (MOSI, MISO, EV0, EV1)
+    sm_config_set_in_pins(&c, mosi_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, mosi_pin, 4, false);
+    
+    // Configure dynamic EV0 line to act as the internal hardware conditional branching target
+    sm_config_set_jmp_pin(&c, ev0_pin);
+    
+    sm_config_set_in_shift(&c, false, true, 16);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+%}
