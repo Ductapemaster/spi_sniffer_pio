@@ -1,13 +1,24 @@
-# Wrapper Makefile to automate CMake builds from the root directory
-BUILD_DIR = build
+# Cambiamos el nombre al target real de tu CMake
+TARGET = spi_sniffer_pio
 
-.PHONY: all clean
+.PHONY: all clean pico1 pico2
 
-all:
-	@mkdir -p $(BUILD_DIR)
-	@cd $(BUILD_DIR) && cmake ..
-	@cmake --build $(BUILD_DIR)
+all: pico1
+
+# Target para la Pico 1 (RP2040)
+pico1:
+	mkdir -p bin
+	cmake -B build -DPICO_BOARD=pico
+	$(MAKE) -C build
+	cp build/$(TARGET).uf2 bin/$(TARGET)_rp2040.uf2
+
+# Target para la Pico 2 (RP2350)
+pico2:
+	mkdir -p bin
+	cmake -B build -DPICO_BOARD=pico2
+	$(MAKE) -C build
+	cp build/$(TARGET).uf2 bin/$(TARGET)_rp2350.uf2
 
 clean:
-	@echo "Cleaning project build directory..."
-	@rm -rf $(BUILD_DIR)
+	rm -rf build/
+	rm -rf bin/
