@@ -161,3 +161,41 @@ To wipe out the generated build artifacts and clear the precompiled binary folde
 ```bash
 make clean
 ```
+
+## Hardware & System Configuration
+
+The project features a centralized global configuration profile using C preprocessor macros. This abstraction layer enables seamless transitioning between hardware platforms, pin configurations, and host-side telemetry formatting before compiling the firmware.
+
+### 1. Target Hardware Selection Profile
+
+The firmware adapts its underlying pin mapping and system initialization code by toggling the main hardware profile macro:
+
+* **Bus Pirate 5 Mode (`TARGET_BUS_PIRATE_5 1`)**:
+    * **Target Architecture**: Optimizes the system topology for the Bus Pirate 5 hardware interface.
+    * **Pin Mapping**: Automatically binds the SPI tap inputs and event lines to physical GPIOs 8 through 13.
+    * **Hardware Abstraction**: Configures `BOARD_INIT()` to invoke `init_bus_pirate_v5_buffers()`, ensuring that on-board bidirectional voltage shifters and logic buffers are safely initialized before execution.
+* **Standard Pico Mode (`TARGET_BUS_PIRATE_5 0`)**:
+    * **Target Architecture**: Provisions a clean layout for standalone Raspberry Pi Pico or Pico 2 boards.
+    * **Pin Mapping**: Maps all connections to a flat, sequential layout using GPIOs 0 through 5.
+    * **Hardware Abstraction**: Binds `BOARD_INIT()` to an optimized, compiler-friendly no-op expression (`((void)0)`), eliminating call overhead.
+
+### 2. Dynamic Hardware Gating
+
+You can dynamically isolate or trigger data acquisition using an external tracking pin:
+
+* **`SPI_TAP_ENABLE_PIN_CONFIG`**:
+    * Set to `1` to activate dynamic hardware gating. The PIO data sampling machine evaluates the state of the designated validation pin, restricting data storage exclusively to windows when the target system is operationally active.
+    * Set to `0` to disable gating. The PIO engine captures data continuously, bypassing pin level evaluation.
+* **`SPI_TAP_ENABLE_PIN`**:
+    * Sets the specific GPIO number (defaults to GPIO 14) dedicated to tracking the status or activation signal of the target board.
+
+### 3. System Settings & Telemetry Formatting
+
+These definitions balance data output structure against available serialization throughput:
+
+* **`SNIFFER_COMPACT_MODE`**:
+    * **Value `0` (Verbose Mode)**: Generates human-readable console outputs, tracking text labels alongside individual line events. Ideal for direct terminal monitoring.
+    * **Value `1` (Compact Parallel Hex Stream)**: Outputs compressed, highly structured parallel hexadecimal frames. This minimizes serial bus congestion and is optimized for processing by host-side Python decoders.
+* **`SNIFFER_TELEMETRY`**:
+    * **Value `1` (Diagnostics Active)**: Interleaves low-level runtime metadata within the execution pipeline to analyze state machine performance and processing loops.
+    * **Value `0` (Clean Production)**: Deactivates non-essential diagnostic output, preserving 100% of the transmission bandwidth for decoded SPI traffic.
