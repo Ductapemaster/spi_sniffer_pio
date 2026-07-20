@@ -24,6 +24,7 @@ A high-performance, passive SPI sniffer designed for the RP2040 and RP2350 micro
 ├── spi_sniffer.pio    # Refactored PIO script with relative pin mapping
 └── tools/
     └── rfid_decoder.py # Host-side Python validation and decoding script
+```
 
 ## PIO-Based SPI Sniffer Working Principle
 
