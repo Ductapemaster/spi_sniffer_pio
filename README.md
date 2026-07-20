@@ -107,3 +107,57 @@ The downstream host-side decoder uses the status of the auxiliary event pins (EV
 | 0 | 0 | DATA | Normal operational data byte transfer via MISO/MOSI lines. |
 | 0 | 1 | START | CS Falling Edge detected. The sniffer engine resets its buffers. |
 | 1 | 1 | STOP | CS Rising Edge detected. Frame closed; incomplete bytes flagged as missing bits. |
+
+## Getting Started
+
+### Quick Start (Precompiled Binaries)
+
+If you want to use the sniffer immediately without installing compiling tools, you can use the pre-built binaries included in this repository:
+
+* **Locate the Binaries**: Navigate to the `bin/` directory in the root of this project.
+* **Select Your Architecture**:
+    * Download `spi_sniffer_pio_rp2040.uf2` if you are using the original Raspberry Pi Pico (RP2040).
+    * Download `spi_sniffer_pio_rp2350.uf2` if you are deploying to the Raspberry Pi Pico 2 (RP2350).
+* **Flash the Board**: Connect your Pico board to your computer via USB while holding down the `BOOTSEL` button, then drag and drop the corresponding `.uf2` file into the mounted mass storage volume.
+
+---
+
+### Development Environment Setup
+
+To compile the firmware from source, your environment must have the ARM GNU Toolchain and the Raspberry Pi Pico SDK (version 2.0.0 or higher is required to compile for the RP2350 platform).
+
+* **Toolchain Installation**: For an automated, streamlined setup of the SDK and compiler tools on Linux or Raspberry Pi OS environments, you can follow the official automated setup resources available at the [Raspberry Pi Pico Setup Repository](https://github.com/raspberrypi/pico-setup).
+* **Environment Configuration**: Make sure that the `PICO_SDK_PATH` environment variable is correctly exported and points to your local installation directory of the Pico SDK.
+
+---
+
+### Building from Source
+
+This project includes a root-level `Makefile` wrapper to automate the standard `cmake` and `make` sequence, eliminating the need for manual build directory navigation.
+
+1. Clone the repository and enter the project directory:
+```bash
+git clone https://github.com/jjsch-dev/spi_sniffer_pio.git
+cd spi_sniffer_pio
+```
+2. Compile for your specific target hardware:
+
+* For Raspberry Pi Pico (RP2040):
+
+```bash
+make pico1
+```
+This command initializes the build folder, targets the standard Pico board profile, runs compilation, and automatically places the output inside bin/spi_sniffer_pio_rp2040.uf2.
+
+* For Raspberry Pi Pico 2 (RP2350):
+
+```bash
+make pico2
+```
+This command configures the build setup utilizing the pico2 board profile to compile for the new architecture, placing the final binary inside bin/spi_sniffer_pio_rp2350.uf2.
+
+2. Clean the environment:
+To wipe out the generated build artifacts and clear the precompiled binary folder, run:
+```bash
+make clean
+```
