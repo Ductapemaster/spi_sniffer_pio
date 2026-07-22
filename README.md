@@ -208,3 +208,64 @@ These definitions balance data output structure against available serialization 
 * **`SNIFFER_TELEMETRY`**:
     * **Value `1` (Diagnostics Active)**: Interleaves low-level runtime metadata within the execution pipeline to analyze state machine performance and processing loops.
     * **Value `0` (Clean Production)**: Deactivates non-essential diagnostic output, preserving 100% of the transmission bandwidth for decoded SPI traffic.
+
+## Real-World Validation & Hardware Verification
+
+To validate signal integrity, timing precision, and decoding accuracy, the sniffer was tested on an electronic lock board equipped with an **NZ3801-AB** RFID reader IC (a pin-to-pin and functionally compatible alternative to the NXP MFRC522). 
+
+Simultaneous captures were performed using a **Raspberry Pi Pico (RP2040)** running this sniffer firmware alongside a **Rigol DHO924S 12-bit Oscilloscope** executing hardware SPI decoding.
+
+---
+
+### Hardware Testbench & Shared Bus Filtering Setup
+
+The target battery-powered lock architecture uses a single, shared SPI bus connecting the main Host CPU to both the **NZ3801-AB RFID Reader** and an **external SPI Flash chip** (storing system code and audio assets). 
+
+To prevent unwanted SPI Flash traffic from flooding the sniffer's RAM buffer:
+* The sniffer connects to `CS`, `CLK`, `MOSI`, and `MISO`.
+* The **`SPI_TAP_ENABLE_PIN`** is tapped directly to the target's `NRSTPW` (Power Down / Reset) line controlled by the Host CPU.
+* **Hardware Dynamic Gating**: When `NRSTPW` goes LOW (RFID chip inactive/power-down), the sniffer automatically halts PIO execution. When `NRSTPW` transitions HIGH, the sniffer clears residual RX noise and enables capture strictly for RFID transactions.
+
+![Hardware Testbench Setup](docs/images/pico_sniffer_spi.jpeg)
+
+*Figure 1: Physical test bench setup showing the electronic lock PCB, RFID ISO/IEC 14443A key fobs, Raspberry Pi Pico sniffer with dynamic tap gating, and Rigol oscilloscope probes.*
+
+---
+
+### PIO Hardware Event Synchronization (`EV0` / `EV1`)
+
+To ensure zero-latency frame demarcation without CPU intervention, internal PIO state machines toggle virtual loopback event pins (`EV0` / `EV1`) on transaction boundaries:
+
+* **`EV_START` (0x01)**: Triggered immediately when `CS` transitions from HIGH to LOW (falling edge).
+* **`EV_STOP`  (0x03)**: Triggered when `CS` returns to HIGH (rising edge).
+
+![PIO Event Pin Signals](docs/images/ev0_ev1.png)
+
+*Figure 2: Oscilloscope trace showing `CS` assertion (CH4 Blue), SPI Clock bursts (CH2 Cyan), and the ultra-narrow hardware pulses generated on `EV0`/`EV1` (CH3 Magenta / CH1 Yellow) marking the exact frame boundaries.*
+
+---
+
+### Decoder Verification: Sniffer Stream vs. Scope Hardware Decoder
+
+The accuracy of the lock-free LUT deinterleaving engine was verified by comparing the sniffer's compact serial output against the oscilloscope's hardware SPI protocol analyzer during active RFID polling cycles.
+
+![SPI Decoding Comparison](docs/images/S28008314P.png)
+
+*Figure 3: Rigol SPI hardware decoder analyzing a 2-byte transfer cycle.*
+
+#### Protocol Analysis Breakdown:
+* **Oscilloscope Hardware Decode:**
+  * **Byte 0**: `MISO = 0x28`, `MOSI = 0x00`
+  * **Byte 1**: `MISO = 0x83`, `MOSI = 0x14`
+* **Sniffer Compact Stream Output:**
+  `S28008314P`
+
+```text
+ S  [28 - 00]  [83 - 14]  P
+ │    │    │     │    │   └── Stop Condition (CS Rise)
+ │    │    │     │    └────── MOSI Byte 1 (0x14)
+ │    │    │     └─────────── MISO Byte 1 (0x83)
+ │    │    └───────────────── MOSI Byte 0 (0x00)
+ │    └────────────────────── MISO Byte 0 (0x28)
+ └─────────────────────────── Start Condition (CS Fall)
+ ```
