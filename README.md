@@ -269,3 +269,57 @@ The accuracy of the lock-free LUT deinterleaving engine was verified by comparin
  │    └────────────────────── MISO Byte 0 (0x28)
  └─────────────────────────── Start Condition (CS Fall)
  ```
+ ## High-Level Protocol & Register Decoder (`rfid_decoder.py`)
+
+To transform raw hardware SPI hex streams into actionable protocol insights, the repository includes an automated Python analysis utility located in `tools/rfid_decoder.py`. 
+
+This tool performs real-time or offline register mapping for **MFRC522** and **NZ3801-AB** RFID controllers. It maps register addresses, interprets internal FIFO operations, and reconstructs high-level **ISO/IEC 14443-A** anti-collision and selection sequences.
+
+---
+
+### Key Features & CLI Usage
+
+The script supports both **live capture** via USB CDC serial streaming and **offline log file processing**:
+
+```bash
+# Live decoding directly from the Pico USB CDC port (Compact Mode)
+./tools/rfid_decoder.py -s /dev/ttyACM0 -c -o spi_NZ3801.log
+
+# Offline analysis of a previously saved sniffer log
+./tools/rfid_decoder.py -f captures/spi_raw_dump.log -c
+```
+
+#### Command-Line Arguments:
+| Argument | Long Option | Description |
+| :--- | :--- | :--- |
+| `-s` | `--serial` | System identifier for live USB CDC serial port (e.g. `/dev/ttyACM0`) |
+| `-f` | `--file` | Path to a saved raw sniffer log file for offline processing |
+| `-c` | `--compact` | Enables decoding for the new ultra-compact stream format (`S88000044P`) |
+| `-o` | `--output` | Path to export a clean, ANSI-color-free log file for documentation |
+| `-b` | `--baud` | Serial transmission baud rate (Default: `115200`) |
+
+> **Engineering Note — Why Use Compact Mode (`-c`)?**  
+> High-frequency SPI bursts generate rapid data volumes. Verbose human-readable text streams can easily saturate the **64-byte USB CDC endpoint buffer** (Full-Speed USB packet limit). This serial transmission bottleneck creates backpressure that risks overflowing the internal lock-free `ram_fifo`.  
+>  
+> The **ultra-compact format** reduces payload footprint to a minimum (e.g., `S88000044P` for a complete transaction cycle), maximizing USB throughput and guaranteeing zero frame loss during high-density transaction bursts.
+
+---
+
+### Real-Time ISO14443-A Card Capture Example
+
+During active RFID polling by the target electronic lock, `rfid_decoder.py` tracks the internal reader FIFO during the **CASCADE 1 ANTICOLLISION** sequence, automatically verifying the card UID and its parity/BCC byte.
+
+#### Physical Test Card:
+![Physical Key Fob UID](docs/images/card_C5099803.jpeg)
+
+*Figure 4: Physical ISO/IEC 14443A key fob with printed UID `C5 09 98 03`.*
+
+#### Live Decoder Console Output:
+![Decoder Terminal Output](docs/images/UUIDC5099803.png)
+
+*Figure 5: Live terminal decoding output showing register state changes, FIFO pop operations, and successful automatic UID extraction (`C5099803`) with BCC validation.*
+
+#### Reconstructed Protocol Flow:
+1. **FIFO Extraction**: The host CPU reads 5 bytes sequentially from `FIFODataReg` (`0xC5`, `0x09`, `0x98`, `0x03`, `0x57`).
+2. **UID Reconstruction**: The script combines the nibbles to identify UID `C5099803` and verifies the final XOR checksum (`BCC OK`).
+3. **Command Tracking**: The script captures the subsequent `TRANSCEIVE (0x0C)` command sent to `CommandReg` to complete the `SELECT Cascade 1` phase.
