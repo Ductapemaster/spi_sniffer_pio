@@ -1,9 +1,12 @@
 /**
- * =============================================================================
  * SPI Bus Sniffer Pico (spi_sniffer_pio)
  * Passive SPI Bus sniffer utilizing the RP2040/RP2350 PIO blocks.
  * (C) Juan Schiavoni 2021-2026
- * =============================================================================
+ *
+ * Utilizes 3 state machines working concurrently via internal loopback 
+ * signaling. Core 0 performs high-speed non-blocking extraction of the 
+ * PIO FIFO into a 40K RAM FIFO. Core 1 decodes and streams the output 
+ * via USB CDC using an optimized 256-byte deinterleaving lookup table.
  */
 
 #include <stdio.h>
@@ -25,42 +28,65 @@
 // ==============================================================================
 // GLOBAL HARDWARE CONFIGURATION PROFILE (Centralized Control Macros)
 // ==============================================================================
-#define TARGET_BUS_PIRATE_5          1  // 1: Bus Pirate 5 Hardware, 0: Standard Raspberry Pi Pico
+#define TARGET_BUS_PIRATE_5          0  // 1: Bus Pirate 5 Hardware, 0: Standard Raspberry Pi Pico
 
 #if TARGET_BUS_PIRATE_5
-    #define MY_SPI_CS_PIN            8  // Physical CS pin on Bus Pirate 5
-    #define MY_SPI_CLK_PIN           9  // Physical CLK pin on Bus Pirate 5
-    #define MY_SPI_MOSI_PIN         10  // Physical MOSI pin (Starts consecutive hardware block)
-    #define MY_SPI_MISO_PIN         11  // Physical MISO pin
-    #define MY_SPI_EV0_PIN          12  // Virtual loopback pin 0 (Must immediately follow MISO)
-    #define MY_SPI_EV1_PIN          13  // Virtual loopback pin 1
-    #define BOARD_INIT()            init_bus_pirate_v5_buffers()
+    #define SPI_CS_PIN               8  // Physical CS            BP5->(IO0) 
+    #define SPI_CLK_PIN              9  // Physical CLK           BP5->(IO1)
+    #define SPI_MOSI_PIN             10 // Physical MOSI          BP5->(IO2)
+    #define SPI_MISO_PIN             11 // Physical MISO          BP5->(IO3)
+    #define SPI_EV0_PIN              12 // Virtual loopback 0     BP5->(I04) (Must immediately follow MISO)
+    #define SPI_EV1_PIN              13 // Virtual loopback 1     BP5->(IO5)
+    #define SPI_TAP_ENABLE_PIN       14 // Enable capture         BP5->(IO6)
+    #define BP5_BUFDIR0_PIN          0 
+    #define BP5_BUFDIR1_PIN          1
+    #define BP5_BUFDIR2_PIN          2
+    #define BP5_BUFDIR3_PIN          3
+    #define BP5_BUFDIR4_PIN          4
+    #define BP5_BUFDIR5_PIN          5
+    #define BP5_BUFDIR6_PIN          6
+    #define BP5_BUFDIR7_PIN          7
+    #undef LED_PIN
 #else
-    #define MY_SPI_CS_PIN            0  // Custom layout for regular Pico
-    #define MY_SPI_CLK_PIN           1  
-    #define MY_SPI_MOSI_PIN          2  
-    #define MY_SPI_MISO_PIN          3  
-    #define MY_SPI_EV0_PIN           4  
-    #define MY_SPI_EV1_PIN           5  
-    #define BOARD_INIT()            ((void)0) 
+    #define SPI_CS_PIN               0  // Custom layout for regular Pico
+    #define SPI_CLK_PIN              1  
+    #define SPI_MOSI_PIN             2  
+    #define SPI_MISO_PIN             3  
+    #define SPI_EV0_PIN              4  
+    #define SPI_EV1_PIN              5  
+    #define SPI_TAP_ENABLE_PIN       6  // Enable capture when HIGH
+    #define LED_PIN                  25
 #endif
 
 #define SPI_TAP_ENABLE_PIN_CONFIG    1  // 1: Enable dynamic hardware gating via monitoring pin, 0: Disabled
-#define SPI_TAP_ENABLE_PIN          14  // Generic configuration pin tracking target operational state
 
-// ==============================================================================
-// SYSTEM SETTINGS & TELEMETRY
-// ==============================================================================
+// Sniffer Output Format Settings
+// 0: Traditional Verbose Mode (S[88-00][00-44]P\r\n) -> ~18 bytes per frame
+// 1: Optimized Compact Mode (S88000044P\n) -> ~11 bytes per frame
 #define SNIFFER_COMPACT_MODE         1  // 0: Verbose Mode, 1: Compact Parallel Hex Stream
-#define SNIFFER_TELEMETRY            0  // 1: Activated diagnostics report, 0: Deactivated clean production
 
-const uint led_pin = 25;
+// Monitor telemetry to diagnose whether USB communication has sufficient 
+// speed to transmit frames without collapsing the 40K RAM buffer.
+// 1: Activated for diagnostics, 0: Deactivated for clean production
+// In bash : tio -b 115200 /dev/ttyACM0 -L --log-file sniff.txt
+// Search: grep -A 5 "Sniffer Telemetry Report" sniff.txt
+// output: --- Sniffer Telemetry Report ---
+//         RAM FIFO High-Water Mark: 0000000056 / 40000
+//         RAM FIFO Total Overflows: 0000000000 
+//         USB CDC Engine Stalls:    0000000000 
+//         -------------------------------
+#define SNIFFER_TELEMETRY            0  
+#define SNIFFER_TELEMETRY_FRAMES     200
+
+#define RAM_FIFO_SIZE                40000
+
 bool ram_fifo_overflow = false;
 
 static uint32_t fifo_max_level = 0;
 static uint32_t fifo_overflow_counter = 0;
 static uint32_t usb_stall_counter = 0;
 static uint32_t transaction_counter = 0;
+static uint32_t pio_rx_stall_counter = 0;
 
 #define ASCII_BUFF_SIZE 1024
 static char ascii_buff[ASCII_BUFF_SIZE];
@@ -70,9 +96,14 @@ static uint8_t mosi_miso_lut[256];
 
 static PIO pio_sniffer = pio0; 
 static uint sm_main;
+static uint sm_data;
+static uint sm_start; 
 
 /**
  * @brief Pre-calculates the deinterleaving values into a 256-byte static LUT.
+ *
+ * Maps an 8-bit interleaved sequence [M3 O3 M2 O2 M1 O1 M0 O0]
+ * directly into separate 4-bit nibbles: MISO in high nibble, MOSI in low nibble.
  */
 void init_decoding_lut(void) {
     for (int i = 0; i < 256; i++) {
@@ -103,6 +134,7 @@ static inline char nibble_to_hex(uint8_t nibble) {
 
 /**
  * @brief Transmits the accumulated text buffer over USB CDC using Bulk transfers.
+ * Handles partial writes safely via memory shifts to maintain protocol stream integrity.
  */
 void buff_send(void) {
     if (ascii_index > 0) {
@@ -125,6 +157,7 @@ void buff_send(void) {
 
 /**
  * @brief High-speed non-blocking character insertion into the local text buffer.
+ * Triggers an emergency data flush and applies backpressure if allocation limits are reached.
  */
 static inline void buff_putchar(char c) {
     if (ascii_index >= ASCII_BUFF_SIZE - 1) {
@@ -138,6 +171,9 @@ static inline void buff_putchar(char c) {
     ascii_buff[ascii_index++] = c;
 }
 
+/**
+ * @brief High-performance helper to append a 10-digit decimal uint32 to the stream.
+ */
 static inline void buff_put_u32_dec10(uint32_t val) {
     char tmp[10];
     for (int i = 9; i >= 0; i--) {
@@ -150,6 +186,9 @@ static inline void buff_put_u32_dec10(uint32_t val) {
     buff_putchar(' ');
 }
 
+/**
+ * @brief High-performance helper to append an 8-digit hexadecimal uint32 to the stream.
+ */
 static inline void buff_put_u32_hex8(uint32_t val) {
     for (int i = 7; i >= 0; i--) {
         buff_putchar(nibble_to_hex(val >> (i * 4)));
@@ -157,6 +196,9 @@ static inline void buff_put_u32_hex8(uint32_t val) {
     buff_putchar(' ');
 }
 
+/**
+ * @brief Helper function to write a null-terminated string into the optimized buffer.
+ */
 static inline void buff_putstring(const char *s) {
     while (*s) {
         buff_putchar(*s++);
@@ -165,6 +207,8 @@ static inline void buff_putstring(const char *s) {
 
 /**
  * @brief Core 1 Processing Loop.
+ * Extracts captures directly from the RAM FIFO, detects control/data phases,
+ * performs LUT-accelerated decoding, and packages data into the streaming text buffer.
  */
 void core1_print() {
     uint32_t val;
@@ -191,9 +235,20 @@ void core1_print() {
         last_data_time = time_us_32();
         buffer_dirty = true;
 
-        gpio_put(led_pin, false);
+#ifdef LED_PIN
+        gpio_put(LED_PIN, false);
+#endif          
+        // 1. Verify if RX FIFO stall occurred on the main state machine
+        uint32_t stall_mask = 1u << (PIO_FDEBUG_RXSTALL_LSB + sm_main);
+    
+        if (pio_sniffer->fdebug & stall_mask) {
+            pio_rx_stall_counter++;
         
-        uint32_t ev_code = (val & 0x000C0000) ? ((val >> 18) & 0x03) : EV_DATA;
+            // Clear flag by writing '1' (W1C) for the next observation window
+            pio_sniffer->fdebug = stall_mask; 
+        }
+        
+        uint32_t ev_code = ((val >> 18) & 0x03);
 
         if (ev_code == EV_START) {
 #if defined(PRINT_TIME_T)
@@ -209,7 +264,7 @@ void core1_print() {
 
 #if SNIFFER_TELEMETRY
             transaction_counter++;
-            if (transaction_counter >= 20000) {
+            if (transaction_counter >= SNIFFER_TELEMETRY_FRAMES) {
                 transaction_counter = 0;
                 
                 buff_putstring("\r\n--- Sniffer Telemetry Report ---\r\n");
@@ -218,6 +273,9 @@ void core1_print() {
                 buff_putstring("/ 40000\r\n");
                 buff_putstring("RAM FIFO Total Overflows: ");
                 buff_put_u32_dec10(fifo_overflow_counter);
+                buff_putstring("\r\n");
+                buff_putstring("PIO RX Hardware Stalls:   ");
+                buff_put_u32_dec10(pio_rx_stall_counter);
                 buff_putstring("\r\n");
                 buff_putstring("USB CDC Engine Stalls:    ");
                 buff_put_u32_dec10(usb_stall_counter);
@@ -253,17 +311,21 @@ void core1_print() {
             buff_putchar(']');
 #endif
         } else {
-            buff_putchar('U');
+            buff_putstring("\r\n[RAW_U:0x");
+            buff_put_u32_hex8(val);
+            buff_putstring("]\r\n");
         }
 
+#ifdef LED_PIN
         if (!ram_fifo_overflow) {
-            gpio_put(led_pin, true);
+            gpio_put(LED_PIN, true);
         }
+#endif
     }
 }
 
 /**
- * @brief Hardware GPIO IRQ callback to monitor generic target power state pin.
+ * @brief Hardware GPIO IRQ callback to monitor target power state pin.
  */
 void spi_tap_enable_callback(uint gpio, uint32_t events) {
     if (gpio == SPI_TAP_ENABLE_PIN) { 
@@ -271,6 +333,7 @@ void spi_tap_enable_callback(uint gpio, uint32_t events) {
             pio_sm_set_enabled(pio_sniffer, sm_main, false);
         } 
         else if (events & GPIO_IRQ_EDGE_RISE) {
+            // Target reader woke up: Clear residual RX noise and enable PIO execution
             pio_sm_clear_fifos(pio_sniffer, sm_main);
             pio_sm_set_enabled(pio_sniffer, sm_main, true);
         }
@@ -278,12 +341,13 @@ void spi_tap_enable_callback(uint gpio, uint32_t events) {
 }
 
 /**
- * @brief Initializes the target tracking input pin and configures its edge-triggered interrupts.
+ * @brief Initializes the target tracking input pin and configures edge-triggered interrupts.
  */
 void setup_spi_tap_enable_pin() {
     gpio_init(SPI_TAP_ENABLE_PIN);
     gpio_set_dir(SPI_TAP_ENABLE_PIN, GPIO_IN);
-    
+    gpio_pull_up(SPI_TAP_ENABLE_PIN); 
+
     gpio_set_irq_enabled_with_callback(
         SPI_TAP_ENABLE_PIN, 
         GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, 
@@ -293,29 +357,58 @@ void setup_spi_tap_enable_pin() {
 }
 
 /**
- * @brief Controls Bus Pirate v5 logic buffers to map level-shifted safe IO pathways.
+ * @brief Configures global hardware pins and Bus Pirate v5 logic buffers.
  */
-void init_bus_pirate_v5_buffers(void) {
-    for (int i = 0; i <= 7; i++) {
-        gpio_init(i);
-        gpio_set_dir(i, GPIO_OUT);
-        gpio_put(i, 0); 
+void init_pins(void) {
+    uint spi_pins[] = {
+        SPI_CS_PIN, 
+        SPI_CLK_PIN, 
+        SPI_MOSI_PIN, 
+        SPI_MISO_PIN, 
+        SPI_EV0_PIN, 
+        SPI_EV1_PIN, 
+    };
+
+    // Configure all tap pins as clean digital inputs
+    for (size_t i = 0; i < sizeof(spi_pins) / sizeof(spi_pins[0]); i++) {
+        gpio_init(spi_pins[i]);
+        gpio_set_dir(spi_pins[i], GPIO_IN);
+        gpio_disable_pulls(spi_pins[i]); 
     }
 
-    for (int i = 8; i <= 15; i++) {
-        gpio_init(i);
-        gpio_set_dir(i, GPIO_IN);
-        gpio_disable_pulls(i); 
+    // CRITICAL: Internal Pull-Up on CS to prevent false PRG1 start triggers from idle noise
+    gpio_pull_up(SPI_CS_PIN);
+
+#if TARGET_BUS_PIRATE_5    
+    uint bp5_pins[] = {
+        BP5_BUFDIR0_PIN, 
+        BP5_BUFDIR1_PIN, 
+        BP5_BUFDIR2_PIN, 
+        BP5_BUFDIR3_PIN, 
+        BP5_BUFDIR4_PIN, 
+        BP5_BUFDIR5_PIN, 
+        BP5_BUFDIR6_PIN,
+        BP5_BUFDIR7_PIN,
+    };
+    
+    // Configure Bus Pirate level shifter buffer direction pins as outputs driven low
+    for (size_t i = 0; i < sizeof(bp5_pins) / sizeof(bp5_pins[0]); i++) {
+        gpio_init(bp5_pins[i]);
+        gpio_set_dir(bp5_pins[i], GPIO_OUT);
+        gpio_put(bp5_pins[i], 0); 
     }
+#endif
+
+#ifdef LED_PIN
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+#endif
 }
 
 int main() {
     float div = 1.0f;
 
-    gpio_init(led_pin);
-    gpio_set_dir(led_pin, GPIO_OUT);
-    
-    BOARD_INIT();
+    init_pins();
     
     stdio_init_all();
 
@@ -323,35 +416,33 @@ int main() {
     setup_spi_tap_enable_pin();
 #endif
 
-    // Synchronously spin up the execution state machines passing the clean configurations
+    // Synchronously spin up execution state machines with clean configurations
     sm_main = pio_claim_unused_sm(pio_sniffer, true);
     uint offset_main = pio_add_program(pio_sniffer, &spi_main_program);
-    spi_main_program_init(pio_sniffer, sm_main, offset_main, div, MY_SPI_MOSI_PIN, MY_SPI_EV0_PIN);
+    spi_main_program_init(pio_sniffer, sm_main, offset_main, div, SPI_MOSI_PIN, SPI_EV0_PIN);
 
-    uint sm_data = pio_claim_unused_sm(pio_sniffer, true);
+    sm_data = pio_claim_unused_sm(pio_sniffer, true);
     uint offset_data = pio_add_program(pio_sniffer, &spi_data_program);
-    spi_data_program_init(pio_sniffer, sm_data, offset_data, div, MY_SPI_CLK_PIN, MY_SPI_CS_PIN, MY_SPI_EV0_PIN);
+    // Corrected call signature: match spi_data_program_init in spi_sniffer.pio
+    spi_data_program_init(pio_sniffer, sm_data, offset_data, div, SPI_CLK_PIN, SPI_CS_PIN);
 
-    uint sm_start = pio_claim_unused_sm(pio_sniffer, true);
+    sm_start = pio_claim_unused_sm(pio_sniffer, true);
     uint offset_start = pio_add_program(pio_sniffer, &spi_start_program);
-    spi_start_program_init(pio_sniffer, sm_start, offset_start, div, MY_SPI_CS_PIN, MY_SPI_EV0_PIN);
+    spi_start_program_init(pio_sniffer, sm_start, offset_start, div, SPI_CS_PIN, SPI_EV0_PIN);
 
-    uint sm_stop = pio_claim_unused_sm(pio_sniffer, true);
-    uint offset_stop = pio_add_program(pio_sniffer, &spi_stop_program);
-    spi_stop_program_init(pio_sniffer, sm_stop, offset_stop, div, MY_SPI_CS_PIN, MY_SPI_EV0_PIN);
-
-    if (!ram_fifo_init(40000)) {
+    if (!ram_fifo_init(RAM_FIFO_SIZE)) {
         while (true);
     }
 
     pio_sm_set_enabled(pio_sniffer, sm_main, true);
     pio_sm_set_enabled(pio_sniffer, sm_start, true);
-    pio_sm_set_enabled(pio_sniffer, sm_stop, true);
     pio_sm_set_enabled(pio_sniffer, sm_data, true);
 
     multicore_launch_core1(core1_print);
-    
-    gpio_put(led_pin, true);
+
+#ifdef LED_PIN    
+    gpio_put(LED_PIN, true);
+#endif
 
     while (true) {
         while (pio_sm_get_rx_fifo_level(pio_sniffer, sm_main) > 0) {
