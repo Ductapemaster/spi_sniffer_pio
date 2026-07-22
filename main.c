@@ -28,7 +28,7 @@
 // ==============================================================================
 // GLOBAL HARDWARE CONFIGURATION PROFILE (Centralized Control Macros)
 // ==============================================================================
-#define TARGET_BUS_PIRATE_5          0  // 1: Bus Pirate 5 Hardware, 0: Standard Raspberry Pi Pico
+#define TARGET_BUS_PIRATE_5          1  // 1: Bus Pirate 5 Hardware, 0: Standard Raspberry Pi Pico
 
 #if TARGET_BUS_PIRATE_5
     #define SPI_CS_PIN               8  // Physical CS            BP5->(IO0) 

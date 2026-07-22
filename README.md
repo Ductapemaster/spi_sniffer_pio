@@ -323,3 +323,55 @@ During active RFID polling by the target electronic lock, `rfid_decoder.py` trac
 1. **FIFO Extraction**: The host CPU reads 5 bytes sequentially from `FIFODataReg` (`0xC5`, `0x09`, `0x98`, `0x03`, `0x57`).
 2. **UID Reconstruction**: The script combines the nibbles to identify UID `C5099803` and verifies the final XOR checksum (`BCC OK`).
 3. **Command Tracking**: The script captures the subsequent `TRANSCEIVE (0x0C)` command sent to `CommandReg` to complete the `SELECT Cascade 1` phase.
+
+## Bus Pirate v5 (BP5) Integration & 5V Logic Benchmarking
+
+To demonstrate system flexibility across different voltage domains and continuous polling architectures, the sniffer firmware was benchmarked on a classic **Arduino Nano (5V logic)** paired with an **NXP MFRC522 RFID shield**.
+
+---
+
+### Hardware Interfacing & 5V Level Shifting
+
+Standard RP2040/RP2350 development boards (e.g., Pico Berry) feature 3.3V-tolerant GPIOs. Tapping directly into a 5V Arduino SPI bus risks exceeding the microcontroller's maximum electrical ratings ($V_{IN} > 3.63\text{V}$), leading to missed signal edge transitions or permanent hardware degradation.
+
+The **Bus Pirate v5 (BP5)** natively solves this issue through its onboard bidirectional level shifters (**`AiP74LVC1T45GC363.T`**) on all buffer pins:
+
+* **Voltage Reference Connection**: The **RED VREF cable** on the BP5 buffer header **must be connected to the target's +5V power rail**. This provides the exact high-side reference voltage for the `AiP74LVC1T45GC363.T` transceivers to safely level-shift 5V SPI signals down to 3.3V for the onboard Pico core.
+
+![Bus Pirate 5 Bench Setup](docs/images/bp5_sniffer_spi.jpeg)
+
+*Figure 6: Bus Pirate v5 connected to the 5V Arduino Nano SPI bus with VREF tapped to +5V, alongside Rigol oscilloscope logic probes.*
+
+---
+
+### High-Density Continuous Polling Stress Test
+
+Unlike battery-powered lock firmware that enters sleep states between card reads, typical Arduino MFRC522 libraries run an aggressive, unmitigated polling loop.
+
+* **Clock Frequency vs. Bus Load**: Although the Arduino SPI clock runs at a lower frequency (**4 MHz** compared to the 6 MHz used in the battery lock), the continuous execution sends non-stop back-to-back command bursts:
+  ```text
+  S08007F04P  --> Read/Write Command
+  S147F800AP  --> FIFO / Control Check
+  S88000004P  --> Status Polling
+  ```
+* **FIFO Throughput Stress**: This non-stop command repetition creates higher sustained byte-per-second throughput than event-driven architectures. The lock-free `ram_fifo` successfully handles this continuous burst stream without dropping frames or incurring USB CDC overrun.
+
+![Rigol Scope BP5 Capture](docs/images/BP5_S08007F04P.png)
+
+*Figure 7: Rigol oscilloscope trace decoding the high-speed repeating `S08007F04P` and `S147F800AP` continuous polling frames captured via BP5.*
+
+---
+
+### Verification: Live Card Detection (`UID: 0483AC03`)
+
+When an ISO/IEC 14443A key fob is presented to the MFRC522 coil under continuous Arduino polling:
+
+#### Physical Card:
+![Physical Card 0483AC03](docs/images/card_0483AC03.jpeg)
+
+*Figure 8: Test key fob with target UID `04 83 AC 03`.*
+
+#### Decoder Stream Capture:
+![Arduino Decoding Console](docs/images/arduino_uui0483AC03.png)
+
+*Figure 9: `rfid_decoder.py` capturing the rapid 5V Arduino stream, isolating `FIFODataReg` pops (`04 83 AC 03 28`), and confirming successful `[CARD CAPTURED] UID: 0483AC03 | Verification: [BCC OK]`.*
