@@ -45,24 +45,33 @@ graph TD
     end
 
     subgraph PIO State Machines
-        PRG1[PRG1: CS-FALL<br/>SM0 / Detects Transaction Start]
-        PRG2[PRG2: CS-RISE<br/>SM1 / Detects Transaction Stop]
-        PRG3[PRG3: MAIN DATA SAMPLER<br/>SM2 / Shifter & Error Detector]
+        SM_START["spi_start (SM_START)<br/>CS Boundary Detector (Fall & Rise)"]
+        SM_DATA["spi_data (SM_DATA)<br/>CS-Gated Clock Sampler"]
+        SM_MAIN["spi_main (SM_MAIN)<br/>Unified Receive Engine & Shifter"]
     end
 
-    subgraph Host Outputs / Event Codes
-        G4[GPIO 4: EV1]
-        G5[GPIO 5: EV0]
+    subgraph Virtual Loopback Lines
+        EV_PINS["GPIO 4/5: EV0 & EV1<br/>(EV_START=0x01 | EV_STOP=0x03 | EV_DATA=0x00)"]
     end
 
-    G0 --> PRG1
-    G0 --> PRG2
-    G1 & G2 & G3 --> PRG3
-    G6 -.->|Enable Control| PRG3
+    subgraph Memory Pipeline
+        PIO_FIFO["PIO RX FIFO<br/>(Joined 8-Word Depth)"]
+        SPSC_FIFO["Lock-Free SPSC RAM FIFO<br/>(40K Word Circular Buffer)"]
+    end
 
-    PRG1 -->|Triggers IRQ 5 & Sets EV=01| PRG3
-    PRG2 -->|Triggers IRQ 5 & Sets EV=11| PRG3
-    PRG3 -->|Pushes Data & Sets EV=00| G4 & G5
+    G0 -->|CS Edges| SM_START
+    G0 -.->|CS Level Check| SM_DATA
+    G1 -->|CLK Sampling Edge| SM_DATA
+    G2 & G3 -->|MOSI / MISO Bits| SM_MAIN
+    G6 -.->|Enable / Disable Control| SM_MAIN
+
+    SM_START -->|Sets EV Pins & Fires IRQ 7| EV_PINS
+    SM_DATA -->|Fires IRQ 7 on Valid Clock| SM_MAIN
+
+    EV_PINS -->|Read via JMP Pin| SM_MAIN
+
+    SM_MAIN -->|16-bit Autopush| PIO_FIFO
+    PIO_FIFO -->|Core 0 Non-Blocking Fetch| SPSC_FIFO
 ```
 
 ## Detailed Component Breakdown
