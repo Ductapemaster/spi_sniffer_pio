@@ -74,27 +74,38 @@ graph TD
     PIO_FIFO -->|Core 0 Non-Blocking Fetch| SPSC_FIFO
 ```
 
-## Detailed Component Breakdown
-### 1. PRG1: CS-FALL (Transaction Initialization)
-* Role: Monitors the Chip Select (CS) line for a high-to-low transition.
+### PIO State Machine Architecture (`spi_sniffer.pio`)
 
-* Operation: As soon as a falling edge is detected on the CS pin, it marks the beginning of an SPI frame. It sets the external event configuration code to START (0x01) via the auxiliary pins (EV1, EV0) and fires the internal hardware interrupt IRQ 5. This immediately signals and synchronizes the main data sampler program.
+The sniffer offloads all microsecond-level timing and protocol framing to three synchronized RP2040 / RP2350 PIO state machines. They communicate via internal hardware interrupts (`IRQ 7`) and virtual event signaling pins (`EV0`, `EV1`).
 
-### 2. PRG2: CS-RISE (Transaction Termination)
-- Role: Monitors the Chip Select (CS) line for a low-to-high transition.
+---
 
-* Operation: When the master de-asserts the CS line, this program detects the rising edge, immediately flags the event pins with the STOP (0x11) code, and triggers IRQ 5. This acts as an asynchronous abort/cleanup signal for the main data loop.
+#### 1. `spi_start` — Chip Select Boundary Detector
+* **Role**: Tracks transaction lifecycle by monitoring Chip Select (`CS`) state changes.
+* **Operation**:
+  * **Frame Start (`EV_START = 0x01`)**: Waits for `CS` to fall LOW, sets virtual event pins to `EV_START` (`EV0=1`, `EV1=0`), fires `IRQ 7` (`IRQ_EVENT`), and stalls execution until `spi_main` acknowledges.
+  * **Frame Stop (`EV_STOP = 0x03`)**: Waits for `CS` to rise HIGH, updates event pins to `EV_STOP` (`EV0=1`, `EV1=1`), fires `IRQ 7`, and stalls until acknowledged by `spi_main`.
 
-### 3. PRG3: Main Data Sampler & Processing Loop
-* Role: Handles synchronization with the SPI serial clock (CLK), shifts raw data from both data lines, and ensures protocol integrity.
+---
 
-* Operation:
+#### 2. `spi_data` — Clock Edge Sampler
+* **Role**: Synchronizes bit sampling directly with the target SPI Clock (`CLK`).
+* **Operation**:
+  * Monitors the incoming `CLK` line for the sampling edge (rising edge).
+  * Evaluates the `CS` pin via hardware `jmp pin`:
+    * If `CS` is HIGH (inactive bus), it skips sampling and waits for `CLK` to return LOW.
+    * If `CS` is LOW (active transaction), it fires `IRQ 7` (`IRQ_EVENT`) and stalls until `spi_main` consumes the clock event.
 
-    * Data Shifting: Upon receiving the initialization trigger from IRQ 5 (via PRG1), it begins sampling both MISO and MOSI lines on the configured edge of the incoming CLK signal.
+---
 
-    * FIFO Management: It relies on the PIO's hardware FIFO AUTO PUSH mechanism to efficiently stream full parsed data blocks down to the RX FIFO buffer where the CPU or DMA can collect them. During regular transmissions, it signals the DATA (0x00) state on the event pins.
-
-    * Bit Missing Detection: If a rising edge interrupt from PRG2 occurs before a full byte structure is shifted in, PRG3 catches the condition, flags a framing error ("Bit Missing"), flushes its internal shift registers, and prepares for the next transaction.
+#### 3. `spi_main` — Unified Event Handler & Data Aggregator
+* **Role**: Central processing unit that consumes `IRQ 7` triggers, manages bit shifting, and handles frame demarcation.
+* **Operation**:
+  * **Event Unpacking**: Blocks on `wait 1 irq IRQ_EVENT`. Upon wakeup, it evaluates `EV0` (mapped as its hardware `jmp_pin`):
+    * **CS Boundary Event (`EV0 == 1`)**: 
+      Takes a snapshot of current pin states into the ISR (`mov isr, pins`) and pads with 16 NULL bits (`in NULL, 16`) to instantly trigger the PIO hardware **Autopush** mechanism. This pushes the frame marker directly into the RX FIFO. Finally, it resets event pins back to `EV_DATA` (`0x00`).
+    * **Data Clock Event (`EV0 == 0`)**: 
+      Executes `in pins, 2` to simultaneously shift 1 bit from `MOSI` and 1 bit from `MISO` into the Shift Register. Autopush automatically pushes parsed 16-bit word pairs down to the lock-free SPSC RAM FIFO every 8 clock cycles.
 
 ## Hardware Configuration & Pinout
 
