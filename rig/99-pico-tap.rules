@@ -1,0 +1,13 @@
+# Raspberry Pi Pico (RP2040) SPI tap.
+#
+# The XIAO ESP32-C6 receiver already claims /dev/ttyACM0, so the Pico lands on
+# ttyACM1 or ttyACM0 depending on enumeration order at boot. Both scripts and
+# humans need a name that does not race: /dev/pico-tap always points at the
+# running firmware, and /dev/pico-boot at the boot ROM mass storage.
+#
+# Vendor 2e8a is Raspberry Pi. Matched on vendor alone for the CDC, because
+# there is exactly one RP2040 on this rig and the product id changes with the
+# stdio configuration. The boot ROM is pinned to 0003, which it always uses.
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", SYMLINK+="pico-tap", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0003", SYMLINK+="pico-boot", MODE="0660", GROUP="plugdev"

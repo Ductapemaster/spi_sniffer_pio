@@ -1,4 +1,3 @@
-# Cambiamos el nombre al target real de tu CMake
 TARGET = spi_sniffer_pio
 
 .PHONY: all clean pico1 pico2
