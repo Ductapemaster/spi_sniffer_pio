@@ -17,6 +17,7 @@
 #include "hardware/clocks.h"
 #include "spi_sniffer.pio.h"
 #include "pico/multicore.h"
+#include "hardware/irq.h"
 #include "tusb.h"
 
 #include "ram_fifo.h"
@@ -220,6 +221,11 @@ void core1_print() {
     
     init_decoding_lut();
 
+    // Core 1 services USB, so it owns USBCTRL_IRQ. Both cores share one
+    // vector table, so the handler tusb_init() installed serves core 1
+    // unchanged.
+    irq_set_enabled(USBCTRL_IRQ, true);
+
     while (true) {
         tud_task();
 
@@ -411,6 +417,11 @@ int main() {
     init_pins();
     
     stdio_init_all();
+
+    // Core 0 runs the PIO drain loop and does not service USB.
+    // stdio_init_all() enables USBCTRL_IRQ on the core that calls it, and
+    // core 1 enables it for itself.
+    irq_set_enabled(USBCTRL_IRQ, false);
 
 #if SPI_TAP_ENABLE_PIN_CONFIG
     setup_spi_tap_enable_pin();

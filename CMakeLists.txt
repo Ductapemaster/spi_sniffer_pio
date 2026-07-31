@@ -35,9 +35,17 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 # Set preprocessor flags for optimized USB CDC performance
-target_compile_definitions(${PROJECT_NAME} PUBLIC 
-    PICO_STDOUT_MUTEX=0 
+target_compile_definitions(${PROJECT_NAME} PUBLIC
+    PICO_STDOUT_MUTEX=0
     PICO_STDIO_ENABLE_CRLF_SUPPORT=0
+
+    # Core 1 services TinyUSB. This keeps the SDK's stdio alarm from calling
+    # tud_task() on core 0.
+    PICO_STDIO_USB_ENABLE_IRQ_BACKGROUND_TASK=0
+
+    # The CDC transmit FIFO holds one full ascii_buff, so buff_send() writes
+    # a buffer in a single call. Keep equal to ASCII_BUFF_SIZE.
+    CFG_TUD_CDC_TX_BUFSIZE=1024
 )
 
 # Enable USB CDC output, disable UART output
